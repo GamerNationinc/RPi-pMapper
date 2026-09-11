@@ -32,8 +32,10 @@ operator manual; this file is for working on the code.
   runnable on Windows. See `tests/README.md`. Run both before committing.
 - `install.sh` installs: `nebula_cam.py` → `/opt/nebula-cam/`,
   `nebula-top`/`nebula-wifi` → `/usr/local/bin/`, both `.service` files,
-  the TOML to the boot partition (first time only). `nebula-update` on the
-  Pi reinstalls the same list — add new files to **both** lists.
+  the TOML to the boot partition (first time only). It is the single
+  source of truth: `nebula-update` on the Pi does `git pull` then re-runs
+  it, so it must stay idempotent and must work **offline** (apt update may
+  fail; everything else must already be there).
 
 ## Status model
 
