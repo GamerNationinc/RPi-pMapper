@@ -226,8 +226,10 @@ def throttled_flags():
 
 
 def wifi_info(iface="wlan0"):
-    """SSID, RSSI and IP without spawning iw. /proc/net/wireless is free."""
-    info = {"iface": iface, "ssid": None, "rssi_dbm": None, "ip": None}
+    """SSID, RSSI, IP and subnet broadcast. RSSI comes free from
+    /proc/net/wireless; SSID and IP cost one short subprocess each, which is
+    why this runs every status_period_s and not every tick."""
+    info = {"iface": iface, "ssid": None, "rssi_dbm": None, "ip": None, "brd": None}
     try:
         with open("/proc/net/wireless") as fh:
             for line in fh:
@@ -250,6 +252,8 @@ def wifi_info(iface="wlan0"):
         parts = out.split()
         if "inet" in parts:
             info["ip"] = parts[parts.index("inet") + 1].split("/")[0]
+        if "brd" in parts:
+            info["brd"] = parts[parts.index("brd") + 1]
     except Exception:
         pass
     return info
@@ -268,6 +272,8 @@ class UdpBridge:
         self.port = port
         self.on_rx = on_rx
         self.peers = {}                     # (ip, port) -> last heard, monotonic
+        self.lock = threading.Lock()        # peers is touched from rx + mav threads
+        self.broadcast = None               # wlan0 subnet broadcast, set by status_loop
         self.rx_bytes = 0
         self.tx_bytes = 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -283,16 +289,24 @@ class UdpBridge:
             except OSError:
                 time.sleep(0.5)
                 continue
-            self.peers[addr] = time.monotonic()
+            with self.lock:
+                self.peers[addr] = time.monotonic()
             self.rx_bytes += len(data)
             self.on_rx(data)
 
     def live_peers(self):
         now = time.monotonic()
-        return [a for a, t in self.peers.items() if now - t < self.PEER_TTL_S]
+        with self.lock:
+            stale = [a for a, t in self.peers.items() if now - t >= self.PEER_TTL_S]
+            for a in stale:
+                del self.peers[a]
+            return list(self.peers)
 
     def send(self, buf):
-        targets = self.live_peers() or [("255.255.255.255", self.port)]
+        # Limited broadcast (255.255.255.255) needs a default route, which the
+        # Pi doesn't have when it is hosting the fallback AP. The subnet
+        # broadcast (10.42.0.255, 192.168.137.255, ...) works in both cases.
+        targets = self.live_peers() or [(self.broadcast or "255.255.255.255", self.port)]
         for addr in targets:
             try:
                 self.sock.sendto(buf, addr)
@@ -301,28 +315,36 @@ class UdpBridge:
                 pass                        # no route yet (WiFi down) - fine
 
 
-STATUS_HTML = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
+# Raw string: the JS below contains backslash escapes that must reach the
+# browser untouched.
+STATUS_HTML = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
 <title>nebula-cam</title>
 <style>body{font:14px/1.4 ui-monospace,monospace;background:#111;color:#ddd;margin:1em}
 h1{font-size:1.4em;margin:0 0 .3em}.ok{color:#7c6}.warn{color:#fc5}.bad{color:#f66}
 pre{white-space:pre-wrap}</style>
 <h1 id=h>nebula-cam</h1><pre id=b>loading...</pre>
 <script>
-async function tick(){try{const s=await(await fetch('/status.json',{cache:'no-store'})).json();
-const c=s.flags.length?(s.flags.some(f=>/DISK|CAMERR|WRITEERR|UNDERVOLT/.test(f))?'bad':'warn'):'ok';
-document.getElementById('h').innerHTML=`<span class=${c}>${s.code} ${s.state}</span> ${s.flags.join(' ')}`;
-const L=s.link,C=s.camera,S=s.session,Y=s.system;
-document.getElementById('b').textContent=
-`FC link   ${L.linked?'up':'DOWN'}  hb ${L.hb_age_s==null?'-':L.hb_age_s.toFixed(1)+'s'}  ${L.msg_rate} msg/s  fix ${L.fix} sats ${L.sats} eph ${L.eph}  clock ${L.clock?'gps':'NONE'}
-camera    ${C.ready?'up':'DOWN'}  ${C.exposure_us}us g${C.gain} ${C.locked?'locked':'auto'}  last capture ${C.last_capture_age_s==null?'-':C.last_capture_age_s.toFixed(1)+'s'}  errors ${C.errors}
-session   ${S.dir||'-'}  frames ${S.frames}  dropped ${S.dropped}  write ${S.last_write_s==null?'-':S.last_write_s.toFixed(2)+'s'} (avg ${S.avg_write_s==null?'-':S.avg_write_s.toFixed(2)+'s'})  ${S.written_mb.toFixed(0)} MB
-storage   ${s.storage.free_mb.toFixed(0)} MB free  ~${s.storage.shots_left} frames left
-queues    capture ${s.queues.capture[0]}/${s.queues.capture[1]}  write ${s.queues.write[0]}/${s.queues.write[1]}
-board     ${Y.cpu_temp_c==null?'-':Y.cpu_temp_c.toFixed(0)+'C'}  load ${Y.load1}  mem ${Y.mem_free_mb==null?'-':Y.mem_free_mb.toFixed(0)+'MB free'}  throttled ${Y.throttled} ${Y.throttle_flags.join(',')}
-wifi      ${Y.wifi.ssid||'-'}  ${Y.wifi.rssi_dbm==null?'':Y.wifi.rssi_dbm+' dBm'}  ${Y.wifi.ip||''}  udp peers ${Y.udp_peers.join(' ')||'none (broadcasting)'}
-uptime    ${Math.floor(s.uptime_s)}s
-
-${s.log.join('\n')}`;}catch(e){document.getElementById('b').textContent='no status: '+e}}
+const SEVERE=/DISKLOW|CAMERR|WRITEERR|UNDERVOLT|HBLOST/;
+const v=(x,u='',d=1)=>x==null?'-':(typeof x=='number'&&!Number.isInteger(x)?x.toFixed(d):x)+u;
+async function tick(){try{
+const s=await(await fetch('/status.json',{cache:'no-store'})).json();
+const c=s.flags.length?(s.flags.some(f=>SEVERE.test(f))?'bad':'warn'):'ok';
+const h=document.getElementById('h');h.textContent='';
+const sp=document.createElement('span');sp.className=c;sp.textContent=s.code+' '+s.state;
+h.append(sp,' '+s.flags.join(' '));
+const L=s.link,C=s.camera,S=s.session,Y=s.system,W=Y.wifi;
+document.getElementById('b').textContent=[
+`FC link   ${L.linked?'up':'DOWN'}  hb ${v(L.hb_age_s,'s')}  ${L.msg_rate} msg/s  fix ${L.fix} sats ${L.sats} eph ${v(L.eph,' m',2)}  clock ${L.clock?'gps':'NONE'}`,
+`camera    ${C.ready?'up':'DOWN'}  ${v(C.exposure_us,'us')} gain ${v(C.gain,'',2)} ${C.locked?'locked':'auto'}  last capture ${v(C.last_capture_age_s,'s')}  errors ${C.errors}`,
+`session   ${S.dir||'-'}  frames ${S.frames}  dropped ${S.dropped}  write ${v(S.last_write_s,'s',2)} (avg ${v(S.avg_write_s,'s',2)})  ${v(S.written_mb,' MB',0)}  errors ${S.write_errors}`,
+`storage   ${v(s.storage.free_mb,' MB free',0)}  ~${s.storage.shots_left} frames left`,
+`queues    capture ${s.queues.capture[0]}/${s.queues.capture[1]}  write ${s.queues.write[0]}/${s.queues.write[1]}`,
+`board     ${v(Y.cpu_temp_c,'C',0)}  load ${v(Y.load1,'',2)}  mem ${v(Y.mem_free_mb,' MB free',0)}  throttled ${Y.throttled} ${Y.throttle_flags.join(',')}`,
+`wifi      ${W.ssid||'-'}  ${v(W.rssi_dbm,' dBm')}  ${W.ip||'no ip'}  udp -> ${Y.udp_peers.join(' ')||'none (broadcasting)'}`,
+`uptime    ${Math.floor(s.uptime_s)}s`,
+'',
+...s.log].join('\n');
+}catch(e){document.getElementById('b').textContent='no status: '+e}}
 tick();setInterval(tick,1000);
 </script>"""
 
@@ -1181,6 +1203,8 @@ class NebulaCam:
             "throttle_flags": thr_flags,
             "wifi": wifi_info(),
         }
+        if self.udp:
+            self.udp.broadcast = self.health["wifi"].get("brd")
 
     def status_loop(self):
         """1 Hz: watchdog, MAVLink heartbeat, status snapshot to tmpfs.

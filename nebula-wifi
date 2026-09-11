@@ -50,7 +50,17 @@ def load_wifi_cfg():
 
 def existing_profiles():
     r = nmcli("-t", "-f", "NAME", "connection", "show")
-    return set(r.stdout.split())
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
+
+
+def active_profile():
+    r = nmcli("-t", "-f", "GENERAL.CONNECTION", "device", "show", IFACE)
+    return r.stdout.strip().split(":")[-1] if r.returncode == 0 else ""
+
+
+def device_state():
+    r = nmcli("-t", "-f", "GENERAL.STATE", "device", "show", IFACE)
+    return r.stdout.strip().split(":")[-1]        # e.g. "100 (connected)"
 
 
 def apply_network(net, band, have):
@@ -72,15 +82,19 @@ def apply_network(net, band, have):
         args += ["wifi.band", band]
     if psk:
         args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk]
-    else:
-        args += ["wifi-sec.key-mgmt", ""]
+    elif name in have:
+        args += ["remove", "wifi-sec"]         # open network: drop any old key
     nmcli(*args, check=True)
     log(f"profile {name} (priority {prio})")
 
 
 def connected():
-    r = nmcli("-t", "-f", "GENERAL.STATE", "device", "show", IFACE)
-    return "connected" in r.stdout and "disconnected" not in r.stdout
+    st = device_state()
+    return "connected" in st and "disconnected" not in st
+
+
+def connecting():
+    return "connecting" in device_state()
 
 
 def start_fallback_ap(ssid, psk):
@@ -109,14 +123,23 @@ def main():
     for net in cfg.get("networks", []):
         apply_network(net, band, have)
 
+    # Re-run by hand while the fallback AP is up: drop it so the real
+    # networks get their chance again.
+    if active_profile() == "nebula-ap":
+        log("fallback AP is up - taking it down to retry known networks")
+        nmcli("connection", "down", "nebula-ap")
+
     if not cfg.get("fallback_ap", False):
         return 0
     deadline = time.monotonic() + float(cfg.get("fallback_after_s", 45))
+    grace = 20.0                                   # once, for a slow DHCP
     while time.monotonic() < deadline:
         if connected():
-            r = nmcli("-t", "-f", "GENERAL.CONNECTION", "device", "show", IFACE)
-            log(f"connected via {r.stdout.strip().split(':')[-1]}")
+            log(f"connected via {active_profile()}")
             return 0
+        if connecting() and grace:
+            deadline += grace
+            grace = 0.0
         time.sleep(2)
     start_fallback_ap(cfg.get("fallback_ap_ssid", "NEBULA-CAM"),
                       cfg.get("fallback_ap_psk", ""))

@@ -171,7 +171,10 @@ def run_curses(source, show_log=True):
                     break
                 time.sleep(0.05)
 
-    curses.wrapper(main)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
 
 
 def main(argv):

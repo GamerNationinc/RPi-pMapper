@@ -15,13 +15,10 @@ for n in ("picamera2", "libcamera"):
     sys.modules[n] = types.ModuleType(n)
 sys.modules["picamera2"].Picamera2 = object
 sys.modules["libcamera"].controls = types.SimpleNamespace()
-sys.modules["simplejpeg"] = None          # force the PIL path (import raises -> None)
+sys.modules["simplejpeg"] = None          # makes `import simplejpeg` raise -> PIL path
 
 sys.path.insert(0, REPO)
-try:
-    import nebula_cam as nc
-except ImportError:
-    sys.modules.pop("simplejpeg"); import nebula_cam as nc
+import nebula_cam as nc
 
 import numpy as np
 
@@ -183,6 +180,11 @@ srv = nc.start_status_http(0, lambda: snap); hport = srv.server_address[1]
 page = urllib.request.urlopen(f"http://127.0.0.1:{hport}/", timeout=2).read().decode()
 js = json.load(urllib.request.urlopen(f"http://127.0.0.1:{hport}/status.json", timeout=2))
 assert "<title>nebula-cam" in page and js["flags"] == snap["flags"]
+# The JS must reach the browser with its escapes intact: a bare newline
+# inside a JS string literal (from a non-raw Python string) is a syntax error.
+assert "join('\\n')" in page, "STATUS_HTML lost its backslash escapes"
+for line in page.splitlines():
+    assert not (line.count("'") % 2 and "join(" in line), f"unterminated JS string: {line}"
 import importlib.machinery; spec = importlib.util.spec_from_loader("ntop", importlib.machinery.SourceFileLoader("ntop", os.path.join(REPO, "nebula-top")))
 ntop = importlib.util.module_from_spec(spec); spec.loader.exec_module(ntop)
 lines = ntop.render(ntop.fetch(f"http://127.0.0.1:{hport}"), width=100)

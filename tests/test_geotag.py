@@ -5,9 +5,8 @@ for name in ("picamera2", "libcamera", "pymavlink", "pymavlink.mavutil", "simple
 sys.modules["picamera2"].Picamera2 = object
 sys.modules["libcamera"].controls = types.SimpleNamespace()
 sys.modules["pymavlink"].mavutil = sys.modules["pymavlink.mavutil"]
-sys.modules["simplejpeg"] = None and None
+sys.modules["simplejpeg"] = None          # makes `import simplejpeg` raise -> PIL path
 import pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-import importlib; sys.modules.pop("simplejpeg")
 import nebula_cam as nc
 from datetime import datetime, timezone
 from PIL import Image
