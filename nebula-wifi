@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+nebula-wifi - apply the [wifi] section of nebula-cam.toml to NetworkManager.
+
+Runs once at boot (nebula-wifi.service), after NetworkManager, and is safe to
+re-run by hand. Every known network (Steam Deck hotspot, laptop hotspot, home
+WiFi, ...) becomes an autoconnect profile; NetworkManager then picks whichever
+is in range by priority. If nothing connects within fallback_after_s and
+fallback_ap is on, the Pi hosts its own AP so you can always reach it.
+
+None of this is on the camera's path. The service starts and captures with
+WiFi absent, broken or misconfigured.
+"""
+
+import os
+import sys
+import time
+import shlex
+import subprocess
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+CONFIG_SEARCH = ["/boot/firmware/nebula-cam.toml", "/boot/nebula-cam.toml",
+                 "/etc/nebula-cam.toml"]
+IFACE = "wlan0"
+
+
+def log(msg):
+    print(f"nebula-wifi: {msg}", flush=True)
+
+
+def nmcli(*args, check=False):
+    cmd = ["nmcli", *args]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        log(f"{' '.join(shlex.quote(a) for a in cmd)} -> {r.stderr.strip()}")
+    return r
+
+
+def load_wifi_cfg():
+    for path in CONFIG_SEARCH:
+        if os.path.exists(path):
+            with open(path, "rb") as fh:
+                return tomllib.load(fh).get("wifi", {}), path
+    return {}, None
+
+
+def existing_profiles():
+    r = nmcli("-t", "-f", "NAME", "connection", "show")
+    return set(r.stdout.split())
+
+
+def apply_network(net, band, have):
+    ssid, psk = net.get("ssid"), net.get("psk", "")
+    if not ssid:
+        return
+    name = f"nebula-{ssid}"
+    prio = str(int(net.get("priority", 0)))
+    if name in have:
+        args = ["connection", "modify", name]
+    else:
+        args = ["connection", "add", "type", "wifi", "con-name", name,
+                "ifname", IFACE, "ssid", ssid]
+    args += ["connection.autoconnect", "yes",
+             "connection.autoconnect-priority", prio,
+             "wifi.powersave", "2",
+             "ipv4.method", "auto", "ipv6.method", "ignore"]
+    if band in ("bg", "a"):
+        args += ["wifi.band", band]
+    if psk:
+        args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk]
+    else:
+        args += ["wifi-sec.key-mgmt", ""]
+    nmcli(*args, check=True)
+    log(f"profile {name} (priority {prio})")
+
+
+def connected():
+    r = nmcli("-t", "-f", "GENERAL.STATE", "device", "show", IFACE)
+    return "connected" in r.stdout and "disconnected" not in r.stdout
+
+
+def start_fallback_ap(ssid, psk):
+    have = existing_profiles()
+    if "nebula-ap" in have:
+        nmcli("connection", "delete", "nebula-ap")
+    args = ["device", "wifi", "hotspot", "ifname", IFACE, "con-name", "nebula-ap",
+            "ssid", ssid, "band", "bg"]
+    if psk:
+        args += ["password", psk]
+    r = nmcli(*args, check=True)
+    if r.returncode == 0:
+        # Never autoconnect the AP: a real network must always win next boot.
+        nmcli("connection", "modify", "nebula-ap", "connection.autoconnect", "no")
+        log(f"no known network - hosting AP '{ssid}' at 10.42.0.1")
+
+
+def main():
+    cfg, path = load_wifi_cfg()
+    if not cfg:
+        log("no [wifi] section - leaving NetworkManager alone")
+        return 0
+    log(f"config: {path}")
+    band = cfg.get("band", "bg")
+    have = existing_profiles()
+    for net in cfg.get("networks", []):
+        apply_network(net, band, have)
+
+    if not cfg.get("fallback_ap", False):
+        return 0
+    deadline = time.monotonic() + float(cfg.get("fallback_after_s", 45))
+    while time.monotonic() < deadline:
+        if connected():
+            r = nmcli("-t", "-f", "GENERAL.CONNECTION", "device", "show", IFACE)
+            log(f"connected via {r.stdout.strip().split(':')[-1]}")
+            return 0
+        time.sleep(2)
+    start_fallback_ap(cfg.get("fallback_ap_ssid", "NEBULA-CAM"),
+                      cfg.get("fallback_ap_psk", ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

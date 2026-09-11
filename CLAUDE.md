@@ -10,13 +10,31 @@ operator manual; this file is for working on the code.
 - `nebula_cam.py` — the whole service, single file, no package. Threads:
   `mav_loop` (telemetry in, arm/disarm, trigger events) → `capture_loop`
   (grab frame + SensorTimestamp) → `write_loop` (encode, EXIF/XMP, CSV) plus
-  `status_loop` (systemd watchdog ping, MAVLink heartbeat + STATUSTEXT).
+  `status_loop` (1 Hz: watchdog ping, MAVLink heartbeat, JSON snapshot;
+  every `status_period_s`: board health + STATUSTEXT). Optional side
+  threads: `UdpBridge` (serial↔UDP 14550 for a GCS on WiFi) and a tiny
+  HTTP status server. Neither may block or fail the camera.
+- `nebula-top` — curses TUI over the status snapshot (file on the Pi, or
+  `http://host:8080` from a laptop). `render()` is pure and testable;
+  keep display logic there, not in the curses loop.
+- `nebula-wifi` + `nebula-wifi.service` — oneshot at boot: turns `[wifi]`
+  in the TOML into NetworkManager profiles, optional fallback AP. Not in
+  nebula-cam's dependency chain, by design.
 - `install.sh` — idempotent Pi provisioning, run once then image the card.
   Also generates `/usr/local/bin/nebula-update` and `nebula-lock`.
 - `nebula-cam.service` — `Type=notify`, `Restart=always`, `WatchdogSec=20`.
 - `nebula-cam.toml` — config; deployed copy lives at
   `/boot/firmware/nebula-cam.toml` so it is editable from an SD reader.
   `DEFAULTS` in `nebula_cam.py` must stay in sync with it.
+
+## Status model
+
+One state (`INIT/NOLINK/READY/REC` = S0–S3) plus flags (`HBLOST NOGPS
+NOCLOCK DROP DISKLOW CAMERR WRITEERR UNDERVOLT THROTTLE SLOW`), computed in
+`NebulaCam.state()` / `flags()` and published identically to STATUSTEXT,
+`/run/nebula-cam/status.json`, the HTTP page and `nebula-top`. Add a new
+condition in exactly those two methods and document it in README §9 and
+`FLAG_HELP` in `nebula-top`; never invent a second vocabulary.
 
 ## Design rules (do not break these)
 
@@ -27,6 +45,15 @@ operator manual; this file is for working on the code.
   `StateBuffer` is stamped with `boottime()`; never mix in `time.time()`.
 - Nothing on the trigger path touches the SD card. Capture and write are
   separate bounded queues; a full queue drops and counts, it never blocks.
+  `WRITE_QUEUE_FRAMES = 3` is the memory budget (35.8 MB per raw frame,
+  512 MB board, no swap) — don't raise it without measuring.
+- Session close is an ordered `CLOSE` sentinel through both queues, so every
+  captured frame lands before the CSV closes. Don't add sleeps to
+  `on_disarm`; the MAVLink thread must never block.
+- All MAVLink TX goes through `_send()` under `tx_lock`, which also mirrors
+  to the UDP bridge. Never call `mav.mav.*_send` directly.
+- The status snapshot goes to `/run` (tmpfs) — never write status to the
+  card.
 - Root filesystem is read-only in the field (overlayfs). Only `/data` is
   writable. Don't add anything that writes elsewhere at runtime.
 - No network dependency anywhere in the boot or capture path. WiFi is an

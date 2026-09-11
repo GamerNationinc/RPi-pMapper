@@ -1,0 +1,15 @@
+[Unit]
+Description=Nebula WiFi profiles from nebula-cam.toml (+ fallback AP)
+# Not in nebula-cam's dependency chain. If this fails, the camera doesn't care.
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nebula-wifi
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

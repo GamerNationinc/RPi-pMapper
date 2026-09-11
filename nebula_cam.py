@@ -14,6 +14,7 @@ Design rules:
 import os
 import sys
 import csv
+import json
 import time
 import math
 import queue
@@ -85,6 +86,14 @@ DEFAULTS = {
         "set_clock_from_gps": True,
         "status_period_s": 5.0,
     },
+    "telemetry": {
+        "udp_enabled": True,      # serial <-> UDP bridge for a GCS on the WiFi
+        "udp_port": 14550,        # QGC / Mission Planner autoconnect port
+    },
+    "status": {
+        "file": "/run/nebula-cam/status.json",   # tmpfs - never the SD card
+        "http_port": 8080,        # 0 = off. http://nebula-cam.local:8080/
+    },
 }
 
 
@@ -116,8 +125,13 @@ def load_config():
 # Small utilities
 # --------------------------------------------------------------------------
 
+LOG_RING = deque(maxlen=30)     # what nebula-top shows in its log pane
+
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    LOG_RING.append(line)
 
 
 def boottime():
@@ -170,6 +184,186 @@ def wrap_lerp_deg(a, b, t):
     """Interpolate heading across the 0/360 seam."""
     d = ((b - a + 180.0) % 360.0) - 180.0
     return (a + d * t) % 360.0
+
+
+# --------------------------------------------------------------------------
+# Board health (everything here must be cheap and must never raise)
+# --------------------------------------------------------------------------
+
+THROTTLE_BITS = {          # vcgencmd get_throttled
+    0: "UNDERVOLT", 1: "FREQ_CAP", 2: "THROTTLED", 3: "TEMP_LIMIT",
+    16: "UNDERVOLT_PAST", 17: "FREQ_CAP_PAST", 18: "THROTTLED_PAST", 19: "TEMP_LIMIT_PAST",
+}
+
+
+def cpu_temp_c():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as fh:
+            return int(fh.read().strip()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+def mem_free_mb():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def throttled_flags():
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True,
+                             text=True, timeout=1.0).stdout
+        val = int(out.strip().split("=")[1], 16)
+    except Exception:
+        return "?", []
+    return hex(val), [name for bit, name in THROTTLE_BITS.items() if val & (1 << bit)]
+
+
+def wifi_info(iface="wlan0"):
+    """SSID, RSSI and IP without spawning iw. /proc/net/wireless is free."""
+    info = {"iface": iface, "ssid": None, "rssi_dbm": None, "ip": None}
+    try:
+        with open("/proc/net/wireless") as fh:
+            for line in fh:
+                if line.strip().startswith(iface + ":"):
+                    info["rssi_dbm"] = int(float(line.split()[3]))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.run(["iw", "dev", iface, "link"], capture_output=True,
+                             text=True, timeout=1.0).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("SSID:"):
+                info["ssid"] = line[5:].strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", iface],
+                             capture_output=True, text=True, timeout=1.0).stdout
+        parts = out.split()
+        if "inet" in parts:
+            info["ip"] = parts[parts.index("inet") + 1].split("/")[0]
+    except Exception:
+        pass
+    return info
+
+
+class UdpBridge:
+    """Raw MAVLink bytes, serial <-> UDP, for a GCS on the WiFi.
+
+    We answer whoever talks to us; until someone does, we broadcast so QGC's
+    UDP autoconnect finds the vehicle with zero configuration. The FC's own
+    radio never routes through here - this is a second, optional path."""
+
+    PEER_TTL_S = 10.0
+
+    def __init__(self, port, on_rx):
+        self.port = port
+        self.on_rx = on_rx
+        self.peers = {}                     # (ip, port) -> last heard, monotonic
+        self.rx_bytes = 0
+        self.tx_bytes = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.bind(("0.0.0.0", port))
+        threading.Thread(target=self._rx_loop, name="udp-rx", daemon=True).start()
+
+    def _rx_loop(self):
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except OSError:
+                time.sleep(0.5)
+                continue
+            self.peers[addr] = time.monotonic()
+            self.rx_bytes += len(data)
+            self.on_rx(data)
+
+    def live_peers(self):
+        now = time.monotonic()
+        return [a for a, t in self.peers.items() if now - t < self.PEER_TTL_S]
+
+    def send(self, buf):
+        targets = self.live_peers() or [("255.255.255.255", self.port)]
+        for addr in targets:
+            try:
+                self.sock.sendto(buf, addr)
+                self.tx_bytes += len(buf)
+            except OSError:
+                pass                        # no route yet (WiFi down) - fine
+
+
+STATUS_HTML = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
+<title>nebula-cam</title>
+<style>body{font:14px/1.4 ui-monospace,monospace;background:#111;color:#ddd;margin:1em}
+h1{font-size:1.4em;margin:0 0 .3em}.ok{color:#7c6}.warn{color:#fc5}.bad{color:#f66}
+pre{white-space:pre-wrap}</style>
+<h1 id=h>nebula-cam</h1><pre id=b>loading...</pre>
+<script>
+async function tick(){try{const s=await(await fetch('/status.json',{cache:'no-store'})).json();
+const c=s.flags.length?(s.flags.some(f=>/DISK|CAMERR|WRITEERR|UNDERVOLT/.test(f))?'bad':'warn'):'ok';
+document.getElementById('h').innerHTML=`<span class=${c}>${s.code} ${s.state}</span> ${s.flags.join(' ')}`;
+const L=s.link,C=s.camera,S=s.session,Y=s.system;
+document.getElementById('b').textContent=
+`FC link   ${L.linked?'up':'DOWN'}  hb ${L.hb_age_s==null?'-':L.hb_age_s.toFixed(1)+'s'}  ${L.msg_rate} msg/s  fix ${L.fix} sats ${L.sats} eph ${L.eph}  clock ${L.clock?'gps':'NONE'}
+camera    ${C.ready?'up':'DOWN'}  ${C.exposure_us}us g${C.gain} ${C.locked?'locked':'auto'}  last capture ${C.last_capture_age_s==null?'-':C.last_capture_age_s.toFixed(1)+'s'}  errors ${C.errors}
+session   ${S.dir||'-'}  frames ${S.frames}  dropped ${S.dropped}  write ${S.last_write_s==null?'-':S.last_write_s.toFixed(2)+'s'} (avg ${S.avg_write_s==null?'-':S.avg_write_s.toFixed(2)+'s'})  ${S.written_mb.toFixed(0)} MB
+storage   ${s.storage.free_mb.toFixed(0)} MB free  ~${s.storage.shots_left} frames left
+queues    capture ${s.queues.capture[0]}/${s.queues.capture[1]}  write ${s.queues.write[0]}/${s.queues.write[1]}
+board     ${Y.cpu_temp_c==null?'-':Y.cpu_temp_c.toFixed(0)+'C'}  load ${Y.load1}  mem ${Y.mem_free_mb==null?'-':Y.mem_free_mb.toFixed(0)+'MB free'}  throttled ${Y.throttled} ${Y.throttle_flags.join(',')}
+wifi      ${Y.wifi.ssid||'-'}  ${Y.wifi.rssi_dbm==null?'':Y.wifi.rssi_dbm+' dBm'}  ${Y.wifi.ip||''}  udp peers ${Y.udp_peers.join(' ')||'none (broadcasting)'}
+uptime    ${Math.floor(s.uptime_s)}s
+
+${s.log.join('\n')}`;}catch(e){document.getElementById('b').textContent='no status: '+e}}
+tick();setInterval(tick,1000);
+</script>"""
+
+
+def start_status_http(port, snapshot):
+    """Tiny read-only page for a phone or the laptop. Threaded, daemon."""
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/status.json"):
+                body, ctype = json.dumps(snapshot()).encode(), "application/json"
+            else:
+                body, ctype = STATUS_HTML.encode(), "text/html; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
+    return srv
+
+
+def write_status_file(path, snap):
+    """Atomic write to tmpfs. nebula-top reads this over ssh."""
+    try:
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(snap, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -449,6 +643,23 @@ class NebulaCam:
         self.picam = None
         self.cam_ready = False
 
+        # Everything nebula-top / the status page can show. Counters only;
+        # the snapshot is assembled once a second in status_loop.
+        self.t_start = time.monotonic()
+        self.udp = None
+        self.hb_last = None
+        self.msg_count = 0
+        self.msg_rate = 0
+        self.last_fix = (0, 0, float("nan"))
+        self.exposure = {"exposure_us": None, "gain": None, "locked": False}
+        self.last_capture_t = None
+        self.cam_errors = 0
+        self.write_errors = 0
+        self.write_times = deque(maxlen=20)
+        self.written_bytes = 0
+        self.health = {}
+        self.snap = {}
+
     # -- camera ----------------------------------------------------------
     def camera_start(self):
         cam = self.cfg["camera"]
@@ -501,6 +712,7 @@ class NebulaCam:
                 locked["ColourGains"] = cg
             self.picam.set_controls(locked)
             time.sleep(0.3)
+            self.exposure = {"exposure_us": exp, "gain": round(gain, 2), "locked": True}
             log(f"exposure locked: {exp} us @ gain {gain:.2f}")
             self.statustext(6, f"CAM exp {exp}us gain {gain:.1f}")
         except Exception as exc:
@@ -539,13 +751,28 @@ class NebulaCam:
                 self.stop.wait(2.0)
 
     def _send(self, name, *args):
-        """Every TX goes through here so packets never interleave."""
+        """Every TX goes through here so packets never interleave. Our own
+        messages are mirrored to the UDP GCS too - the FC won't echo them."""
+        mav = self.mav
+        if mav is None:
+            return
+        try:
+            msg = getattr(mav.mav, name[:-len("_send")] + "_encode")(*args)
+            with self.tx_lock:
+                mav.mav.send(msg)
+            if self.udp:
+                self.udp.send(msg.get_msgbuf())
+        except Exception:
+            pass
+
+    def udp_rx(self, data):
+        """GCS -> FC. Raw bytes straight onto the serial port."""
         mav = self.mav
         if mav is None:
             return
         try:
             with self.tx_lock:
-                getattr(mav.mav, name)(*args)
+                mav.write(data)
         except Exception:
             pass
 
@@ -593,16 +820,20 @@ class NebulaCam:
                 continue
             t = boottime()
             kind = msg.get_type()
+            self.msg_count += 1
+            if self.udp and kind != "BAD_DATA":
+                self.udp.send(msg.get_msgbuf())
 
             if kind == "GLOBAL_POSITION_INT":
                 self.buf.add_pos(t, msg.lat / 1e7, msg.lon / 1e7,
                                  msg.alt / 1000.0, msg.relative_alt / 1000.0)
                 self.maybe_fallback_trigger(msg)
             elif kind == "GPS_RAW_INT":
+                eph = (msg.eph / 100.0) if msg.eph < 65535 else float("nan")
                 self.buf.add_gps(t, msg.lat / 1e7, msg.lon / 1e7,
                                  msg.alt / 1000.0, msg.fix_type,
-                                 msg.satellites_visible,
-                                 (msg.eph / 100.0) if msg.eph < 65535 else float("nan"))
+                                 msg.satellites_visible, eph)
+                self.last_fix = (msg.fix_type, msg.satellites_visible, eph)
             elif kind == "ATTITUDE":
                 self.buf.add_att(t, msg.roll, msg.pitch, msg.yaw)
             elif kind == "SYSTEM_TIME":
@@ -644,6 +875,7 @@ class NebulaCam:
         if msg.get_srcSystem() != self.mav.target_system or \
                 msg.get_srcComponent() != mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1:
             return
+        self.hb_last = time.monotonic()
         armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
         if armed == self.armed:
             return
@@ -672,6 +904,7 @@ class NebulaCam:
         self.close_session()
         try:
             self.picam.set_controls({"AeEnable": True, "AwbEnable": True})
+            self.exposure["locked"] = False
         except Exception:
             pass
 
@@ -732,6 +965,7 @@ class NebulaCam:
             try:
                 request = self.picam.capture_request()
             except Exception as exc:
+                self.cam_errors += 1
                 log(f"capture failed: {exc}")
                 self.statustext(3, "CAM capture error")
                 continue
@@ -740,6 +974,7 @@ class NebulaCam:
                 array = request.make_array("main")
             finally:
                 request.release()
+            self.last_capture_t = time.monotonic()
 
             sensor_ts = meta.get("SensorTimestamp")
             if sensor_ts:
@@ -825,51 +1060,185 @@ class NebulaCam:
                 ])
                 # The README asks you to read this number before planning a
                 # mission: it is the real per-frame write cost on this card.
-                log(f"{name} {len(data) / 1e6:.1f} MB in {time.monotonic() - t0:.2f} s")
+                dt = time.monotonic() - t0
+                self.write_times.append(dt)
+                self.written_bytes += len(data)
+                log(f"{name} {len(data) / 1e6:.1f} MB in {dt:.2f} s")
             except Exception as exc:
+                self.write_errors += 1
                 log(f"write failed for {name}: {exc}")
                 self.statustext(3, "CAM write error")
 
     # -- status ----------------------------------------------------------
+    # State codes (exactly one) and flags (any number). Documented in README
+    # section 9; nebula-top and the STATUSTEXT line both use them.
+    STATES = {"INIT": "S0", "NOLINK": "S1", "READY": "S2", "REC": "S3"}
+
+    def state(self):
+        with self.session_lock:
+            session = self.session
+        if session:
+            return "REC", session
+        if not self.cam_ready:
+            return "INIT", None
+        if not self.linked:
+            return "NOLINK", None
+        return "READY", None
+
+    def flags(self, free):
+        f = []
+        if self.hb_last is not None and time.monotonic() - self.hb_last > 3.0:
+            f.append("HBLOST")
+        if self.last_fix[0] < 3:
+            f.append("NOGPS")
+        if self.gps_epoch_offset is None:
+            f.append("NOCLOCK")
+        if self.dropped:
+            f.append("DROP")
+        if free < self.cfg["storage"]["min_free_mb"]:
+            f.append("DISKLOW")
+        if self.cam_errors:
+            f.append("CAMERR")
+        if self.write_errors:
+            f.append("WRITEERR")
+        thr = self.health.get("throttle_flags", [])
+        if "UNDERVOLT" in thr:
+            f.append("UNDERVOLT")
+        elif "THROTTLED" in thr or "TEMP_LIMIT" in thr:
+            f.append("THROTTLE")
+        if self.write_times and sum(self.write_times) / len(self.write_times) > 1.2:
+            f.append("SLOW")
+        return f
+
+    def snapshot(self):
+        """Everything nebula-top and the HTTP page display. Built at 1 Hz."""
+        now = time.monotonic()
+        state, session = self.state()
+        free = free_mb(self.cfg["storage"]["root"])
+        wt = list(self.write_times)
+        try:
+            load1 = round(os.getloadavg()[0], 2)
+        except (OSError, AttributeError):
+            load1 = None
+        return {
+            "ts": time.time(),
+            "uptime_s": now - self.t_start,
+            "code": self.STATES[state],
+            "state": state,
+            "flags": self.flags(free),
+            "link": {
+                "linked": self.linked,
+                "device": self.cfg["link"]["device"],
+                "hb_age_s": None if self.hb_last is None else now - self.hb_last,
+                "msg_rate": self.msg_rate,
+                "fix": self.last_fix[0], "sats": self.last_fix[1],
+                "eph": None if not math.isfinite(self.last_fix[2]) else round(self.last_fix[2], 2),
+                "clock": self.gps_epoch_offset is not None,
+                "clock_stepped": self.clock_set,
+            },
+            "camera": {
+                "ready": self.cam_ready,
+                "size": [self.cfg["camera"]["width"], self.cfg["camera"]["height"]],
+                **self.exposure,
+                "last_capture_age_s": None if self.last_capture_t is None else now - self.last_capture_t,
+                "errors": self.cam_errors,
+            },
+            "session": {
+                "dir": session.dir.name if session else None,
+                "frames": session.count if session else 0,
+                "dropped": self.dropped,
+                "last_write_s": wt[-1] if wt else None,
+                "avg_write_s": (sum(wt) / len(wt)) if wt else None,
+                "written_mb": self.written_bytes / 1e6,
+                "write_errors": self.write_errors,
+            },
+            "storage": {"free_mb": free, "shots_left": int(free / 4.5)},
+            "queues": {
+                "capture": [self.capture_q.qsize(), self.capture_q.maxsize],
+                "write": [self.write_q.qsize(), self.write_q.maxsize],
+            },
+            "system": {
+                "cpu_temp_c": self.health.get("cpu_temp_c"),
+                "load1": load1,
+                "mem_free_mb": self.health.get("mem_free_mb"),
+                "throttled": self.health.get("throttled", "?"),
+                "throttle_flags": self.health.get("throttle_flags", []),
+                "wifi": self.health.get("wifi", {"ssid": None, "rssi_dbm": None, "ip": None}),
+                "udp_peers": [f"{ip}:{port}" for ip, port in self.udp.live_peers()] if self.udp else [],
+                "udp_rx_kb": (self.udp.rx_bytes / 1e3) if self.udp else 0,
+                "udp_tx_kb": (self.udp.tx_bytes / 1e3) if self.udp else 0,
+            },
+            "log": list(LOG_RING),
+        }
+
+    def gather_health(self):
+        """The slow bits (subprocesses). Every status_period_s, not every tick."""
+        thr_hex, thr_flags = throttled_flags()
+        self.health = {
+            "cpu_temp_c": cpu_temp_c(),
+            "mem_free_mb": mem_free_mb(),
+            "throttled": thr_hex,
+            "throttle_flags": thr_flags,
+            "wifi": wifi_info(),
+        }
+
     def status_loop(self):
-        """1 Hz: watchdog + MAVLink heartbeat. Every status_period_s: the one
-        line the operator reads in QGC before takeoff."""
+        """1 Hz: watchdog, MAVLink heartbeat, status snapshot to tmpfs.
+        Every status_period_s: board health and the one STATUSTEXT line the
+        operator reads in QGC before takeoff."""
         period = self.cfg["system"]["status_period_s"]
+        status_file = self.cfg["status"]["file"]
         last_status = -period
         last_text = None
+        last_count, last_rate_t = 0, time.monotonic()
         while not self.stop.is_set():
             self.notify.ping()
             self.heartbeat()
             now = time.monotonic()
+            if now - last_rate_t >= 1.0:
+                self.msg_rate = int((self.msg_count - last_count) / (now - last_rate_t))
+                last_count, last_rate_t = self.msg_count, now
             if now - last_status >= period:
                 last_status = now
-                mb = free_mb(self.cfg["storage"]["root"])
-                shots = int(mb / 4.5)   # ~4.5 MB per 12 MP frame
-                with self.session_lock:
-                    session = self.session
-                if session:
-                    state, n = "REC", session.count
-                elif not self.cam_ready:
-                    state, n = "INIT", 0
-                elif not self.linked:
-                    state, n = "NOLINK", 0
-                else:
-                    state, n = "READY", 0
-                text = f"CAM {state} {n}f {shots} left"
-                if self.dropped:
-                    text += f" DROP{self.dropped}"
+                self.gather_health()
+                snap = self.snapshot()
+                state, session = snap["state"], snap["session"]
+                text = f"CAM {state} {session['frames']}f {snap['storage']['shots_left']} left"
+                if snap["flags"]:
+                    text += " " + ",".join(snap["flags"])
                 self.notify.status(text)
-                sev = 4 if (self.dropped or state not in ("READY", "REC") or mb < 512) else 6
-                self.statustext(sev, text)
+                bad = state not in ("READY", "REC") or any(
+                    f in snap["flags"] for f in ("DISKLOW", "CAMERR", "WRITEERR", "UNDERVOLT", "HBLOST"))
+                self.statustext(4 if (bad or snap["flags"]) else 6, text)
                 if text != last_text:
                     log(text)
                     last_text = text
+            else:
+                snap = self.snapshot()
+            self.snap = snap
+            if status_file:
+                write_status_file(status_file, snap)
             self.stop.wait(1.0)
 
     # -- lifecycle -------------------------------------------------------
     def run(self):
         Path(self.cfg["storage"]["root"]).mkdir(parents=True, exist_ok=True)
         self.camera_start()
+
+        # Optional network side. Neither is allowed to stop the camera.
+        tele, status = self.cfg["telemetry"], self.cfg["status"]
+        if tele["udp_enabled"]:
+            try:
+                self.udp = UdpBridge(int(tele["udp_port"]), self.udp_rx)
+                log(f"udp telemetry bridge on :{tele['udp_port']}")
+            except OSError as exc:
+                log(f"udp bridge disabled: {exc}")
+        if status["http_port"]:
+            try:
+                start_status_http(int(status["http_port"]), lambda: self.snap or self.snapshot())
+                log(f"status page on :{status['http_port']}")
+            except OSError as exc:
+                log(f"status http disabled: {exc}")
 
         self.workers = [
             threading.Thread(target=self.capture_loop, name="capture", daemon=True),

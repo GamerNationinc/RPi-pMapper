@@ -28,7 +28,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   python3-picamera2 python3-simplejpeg python3-pip python3-numpy python3-pil \
   python3-lxml python3-future python3-tomli \
-  fake-hwclock avahi-daemon rsync git
+  fake-hwclock avahi-daemon rsync git iw
 pip3 install --break-system-packages pymavlink piexif
 
 # ---------------------------------------------------------------- boot config
@@ -95,6 +95,9 @@ say "installing nebula-cam"
 mkdir -p /opt/nebula-cam
 install -m 755 "$SRC/nebula_cam.py"     /opt/nebula-cam/nebula_cam.py
 install -m 644 "$SRC/nebula-cam.service" /etc/systemd/system/nebula-cam.service
+install -m 755 "$SRC/nebula-top"          /usr/local/bin/nebula-top
+install -m 755 "$SRC/nebula-wifi"         /usr/local/bin/nebula-wifi
+install -m 644 "$SRC/nebula-wifi.service" /etc/systemd/system/nebula-wifi.service
 [[ -f $BOOT/nebula-cam.toml ]] || install -m 644 "$SRC/nebula-cam.toml" "$BOOT/nebula-cam.toml"
 
 # Keep a git checkout for nebula-update to pull from. If we were run from a
@@ -122,6 +125,9 @@ fi
 cd /opt/nebula-cam-src && git pull
 install -m 755 nebula_cam.py /opt/nebula-cam/nebula_cam.py
 install -m 644 nebula-cam.service /etc/systemd/system/nebula-cam.service
+install -m 755 nebula-top /usr/local/bin/nebula-top
+install -m 755 nebula-wifi /usr/local/bin/nebula-wifi
+install -m 644 nebula-wifi.service /etc/systemd/system/nebula-wifi.service
 systemctl daemon-reload && systemctl restart nebula-cam
 echo "updated. remember: sudo nebula-lock"
 EOF
@@ -139,13 +145,15 @@ chmod 755 /usr/local/bin/nebula-lock
 
 systemctl daemon-reload
 systemctl enable nebula-cam.service
+systemctl enable nebula-wifi.service
 
 say "done"
 cat <<'EOF'
 
 Next steps:
   1. reboot and confirm:  systemctl status nebula-cam
-  2. verify the FC link:  journalctl -u nebula-cam -f   (expect "linked to system 1")
+  2. verify the FC link:  nebula-top   (expect S2 READY; S1 NOLINK = no FC heartbeat)
+     or from a laptop on the same WiFi:  http://nebula-cam.local:8080/
   3. set the ArduPilot params listed in README.md
   4. run the latency calibration in README.md, write the result into
      /boot/firmware/nebula-cam.toml

@@ -146,7 +146,7 @@ swapping conventions mid-project shifts a block vertically by that amount.
 | Kernel/board hang | BCM hardware watchdog, 15 s |
 | Python hang | systemd `WatchdogSec=20`, fed by the status thread |
 | Service crash | `Restart=always`, `StartLimitIntervalSec=0` — it never gives up |
-| WiFi not present | No network unit in the boot path; both wait-online units masked |
+| WiFi not present | No network unit in the boot path; both wait-online units masked; `nebula-wifi` is a separate oneshot |
 | No RTC → 1970 timestamps | Clock stepped from MAVLink `SYSTEM_TIME` on first fix, plus `fake-hwclock` |
 | Card full | Session refused below 512 MB, shouted over MAVLink |
 | Camera dead / cable loose | `STATUSTEXT` heartbeat is absent or reports an error — visible in QGC before takeoff |
@@ -158,25 +158,57 @@ The pre-flight check is one line in the QGC message panel:
 CAM READY 0f 1420 left
 ```
 
-No message, no takeoff.
+No message, no takeoff. Section 9 lists every state and flag, and
+`nebula-top` shows all of it live.
 
 ---
 
-## 7. Steam Deck ground station
+## 7. Ground station WiFi (Steam Deck, laptop, or the Pi's own AP)
 
-The Pi joins the Deck's hotspot as a client and advertises `nebula-cam.local`
-over mDNS. It is never a dependency — the camera works with the Deck switched
-off.
+The Pi joins whichever known hotspot is in range and advertises
+`nebula-cam.local` over mDNS. WiFi is never a dependency — the camera works
+with every ground device switched off. All of it is configured in the `[wifi]`
+section of `/boot/firmware/nebula-cam.toml` and applied at boot by
+`nebula-wifi.service`:
+
+```toml
+[wifi]
+band = "bg"                       # 2.4 GHz only: range beats throughput
+networks = [
+  { ssid = "NEBULA-GCS",    psk = "...", priority = 20 },   # Steam Deck
+  { ssid = "NEBULA-LAPTOP", psk = "...", priority = 10 },   # laptop
+]
+fallback_ap = true                # nothing in range after 45 s -> Pi hosts NEBULA-CAM
+fallback_ap_psk = "nebulacam"
+```
+
+Highest priority in range wins. Edit the file from any SD card reader, no SSH
+needed. The passwords are readable by anyone holding the card, so use hotspot
+passwords you don't care about.
+
+**Steam Deck** (desktop mode):
 
 ```bash
-# on the Deck, desktop mode
 nmcli device wifi hotspot ifname wlan0 ssid NEBULA-GCS password <yours>
 ```
 
-Two things to plan around:
+**Laptop** — turn on the OS hotspot and put its SSID/password in the TOML:
 
-- The Deck cannot host a hotspot and be on WiFi at the same time. Offload is
-  an offline activity, or you bring a USB-C ethernet dongle.
+- Windows: *Settings → Network & internet → Mobile hotspot*, set **Band = 2.4 GHz**
+  (some laptops default to 5 GHz, which the Pi will not see with `band = "bg"`).
+  Clients get `192.168.137.x`. `nebula-cam.local` resolves on Windows 10 1903+;
+  if it doesn't, the hotspot panel lists connected devices with their IPs.
+- macOS: *System Settings → General → Sharing → Internet Sharing* to Wi-Fi.
+- Linux: same `nmcli … hotspot` line as the Deck.
+
+**No hotspot at all:** after `fallback_after_s` the Pi hosts `NEBULA-CAM`
+itself at `10.42.0.1`. Join it from anything and open `http://10.42.0.1:8080/`.
+The AP profile never autoconnects, so a real network always wins next boot.
+
+Things to plan around:
+
+- Neither the Deck nor a laptop can host a hotspot and be on WiFi at the same
+  time. Offload is an offline activity, or you bring a USB ethernet dongle.
 - Zero 2 W WiFi tops out around 2–3 MB/s in practice. A 300-frame flight is
   ~1.4 GB, so budget ~10 minutes. For a survey day, pull the card or move
   `/data` to a USB-OTG stick.
@@ -191,13 +223,155 @@ sudo nebula-lock      # re-enable read-only root - do not forget this
 
 ---
 
-## 8. Build order
+## 8. WiFi as a telemetry link, and how far it reaches
+
+With `[telemetry] udp_enabled = true` the service bridges the FC's serial
+stream to UDP 14550 on the WiFi. QGC on the laptop or Deck autoconnects with
+no setup; Mission Planner: *UDP, port 14550, Connect*. Everything the FC
+sends on TELEM2 (at the 10 Hz rates the Pi requests) plus the Pi's own
+`STATUSTEXT` lines arrive, and anything the GCS sends goes straight to the FC
+— parameters, mission upload, mode changes, `DO_DIGICAM_CONTROL`.
+
+Two rules:
+
+1. **This is a second path, not the primary one.** If the drone is flown on a
+   real telemetry radio (SiK 915 MHz on TELEM1), keep it. The WiFi link adds a
+   dependency on the Pi, which is exactly what section 6 spent its effort
+   avoiding for the *camera*; for *control* of the aircraft that dependency
+   is not acceptable.
+2. WiFi is fine for **telemetry** (a few kB/s, tolerant of packet loss) and
+   hopeless for **video**. Do not try.
+
+### What 100 acres looks like
+
+100 acres ≈ 405 000 m² ≈ a 636 m square. Farthest point from the GCS:
+
+| GCS position | Max slant range |
+|---|---|
+| centre of the block | ~450 m |
+| middle of one edge | ~710 m |
+| a corner | ~900 m |
+
+Stand in the middle of the long edge if you can. Every metre of ground
+antenna height also matters: at 900 m the first Fresnel zone is ~5 m across,
+so an antenna at head height over a crop is already half-blocked.
+
+### Ground-side adapter
+
+Keep the airframe side stock. The Zero 2 W's on-board radio (~17 dBm, PCB
+antenna) is 0 g extra and the mass budget in section 1 has no room for a USB
+adapter (40–60 g). Put all the gain on the ground instead; antenna gain helps
+both directions equally.
+
+| Ground setup | Realistic telemetry range (LOS, 2.4 GHz) |
+|---|---|
+| Laptop / Deck internal WiFi | 150–300 m — covers the block only from the centre, marginally |
+| **Alfa AWUS036ACHM** (MT7610U, in-kernel `mt76x0u`, RP-SMA, up to 23 dBm) with its stock 5 dBi omni | 400–600 m |
+| Same Alfa + **14 dBi 2.4 GHz panel** on a photo tripod, pointed at the block | 800–1200 m |
+| **Ubiquiti NanoStation Loco M2** as the field AP (built-in 8 dBi panel, 23 dBm, outdoor, PoE from a 24 V battery), laptop on ethernet | 1–2 km, most robust; also the only option that leaves the laptop's WiFi free |
+
+The AWUS036ACHM is the pick because it needs no driver on Linux/Deck (kernel
+5.x+), Alfa ships a Windows driver, and it has a real antenna connector. The
+AWUS036ACM (MT7612U) is the 5 GHz-capable sibling; irrelevant here, 5 GHz is
+the wrong band for range.
+
+Link budget for the sceptical, Pi → ground at 900 m: free-space loss at
+2.437 GHz is 99 dB. 17 dBm TX − 1 dBi PCB antenna − 99 dB + 14 dBi panel
+− 1 dB cable = **−70 dBm** at the Alfa, whose 1 Mbps sensitivity is about
+−93 dBm: 23 dB of margin on paper, call it 8–10 dB after airframe shadowing
+and fading. Workable for telemetry. With the laptop's own 2 dBi antenna the
+same sum is −81 dBm and the margin evaporates in the real world.
+
+### Getting the most out of it
+
+- **Lock 2.4 GHz** (`band = "bg"`, already the default) and 20 MHz channels.
+  Pick channel 1, 6 or 11, whichever is quiet where you fly.
+- **Windows hotspot cannot be told which adapter to use.** The simplest way to
+  get the Alfa's antenna into the link on a Windows laptop is the other way
+  round: let the Pi host `NEBULA-CAM` (fallback AP, or set it as the only
+  network) and have the Alfa *join* it. Gain is gain regardless of who is
+  the AP. On Linux/Deck you can host the hotspot on the Alfa directly:
+  `nmcli device wifi hotspot ifname wlx… ssid NEBULA-GCS password …`.
+- **Point the panel** at the survey block and raise it: 2–3 m on a light
+  mast beats anything else you can do for the money.
+- **Airframe:** the Zero 2 W's antenna is the trace at the board edge next
+  to the camera connector. Mount that edge outboard, away from carbon fibre,
+  the battery and the GPS mast. Carbon is a near-perfect shield.
+- **Power saving off** on the Pi (installer does this; `nebula-wifi` sets it
+  on every profile it creates) — power save is what makes a link that
+  *looks* fine drop packets every few seconds.
+- **Watch it live:** `nebula-top` shows RSSI, the UDP peers and byte counts.
+  Below about −80 dBm expect loss; below −87 dBm it is gone.
+- **Regulatory (Canada, RSS-247):** 2.4 GHz EIRP limit is 36 dBm for
+  point-to-multipoint. 20 dBm + 14 dBi = 34 dBm is legal; do not stack a
+  1 W amplifier on top of the panel.
+
+If you need telemetry you can bet an aircraft on at 900 m, the answer is not
+more WiFi — it is a 915 MHz SiK radio (Holybro SiK 500 mW: ~2 km; RFD900x:
+tens of km) on TELEM1, with the WiFi kept for the status page and offload.
+
+---
+
+## 9. Knowing what it is doing: status codes and `nebula-top`
+
+The service publishes one **state** and any number of **flags**, everywhere
+at once: the `STATUSTEXT` line in QGC, a JSON snapshot on tmpfs, an HTTP
+page, `systemctl status`, and the journal (on change only).
+
+| State | Code | Meaning |
+|---|---|---|
+| `INIT`   | S0 | camera starting |
+| `NOLINK` | S1 | camera up, no FC heartbeat yet — check TELEM2 wiring/params |
+| `READY`  | S2 | linked, disarmed. **This is the pre-flight line.** |
+| `REC`    | S3 | armed, session open, capturing |
+
+| Flag | Meaning | Action |
+|---|---|---|
+| `HBLOST`   | FC heartbeat older than 3 s | link fault mid-flight; geotags degrade |
+| `NOGPS`    | GPS fix < 3D | normal indoors; **no takeoff** outdoors |
+| `NOCLOCK`  | no `SYSTEM_TIME` from FC yet | UTC in EXIF/CSV will be blank until it arrives |
+| `DROP`     | frames dropped this session | slow down / drop resolution |
+| `DISKLOW`  | below `min_free_mb` | session refused on arm; clear the card |
+| `CAMERR`   | a capture failed | ribbon / camera fault |
+| `WRITEERR` | a JPEG write failed | card fault; check journal |
+| `UNDERVOLT`| board under-voltage (`vcgencmd`) | **fix power now** — this kills cards |
+| `THROTTLE` | CPU thermally throttled | shade / airflow; write times will grow |
+| `SLOW`     | average write > 1.2 s | mission speed must come down |
+
+In QGC the line reads e.g. `CAM REC 42f 1300 left DROP,SLOW`. Any flag
+raises the severity so the message panel colours it.
+
+### `nebula-top`
+
+A btop-style live view. On the Pi it reads `/run/nebula-cam/status.json`;
+from a laptop it reads the HTTP endpoint:
+
+```bash
+nebula-top                                   # over ssh, on the Pi
+nebula-top http://nebula-cam.local:8080      # from the laptop / Deck
+nebula-top --once                            # one frame, no curses (scripts)
+```
+
+It shows: FC link (heartbeat age, msg/s, fix/sats/EPH, GPS clock), camera
+(exposure/gain lock, last capture age, errors), session (frames, dropped,
+last/avg write time, MB written), queue fill bars, storage, board (CPU temp,
+load, free memory, throttle flags), WiFi (SSID, RSSI, IP, UDP peers) and the
+last dozen log lines. Red = act now, yellow = watch, green = fine. `q` quits,
+`l` hides the log.
+
+The same data on a phone: `http://nebula-cam.local:8080/` (or
+`http://10.42.0.1:8080/` on the fallback AP). Raw JSON at `/status.json`
+if you want to script against it.
+
+---
+
+## 10. Build order
 
 1. Flash Raspberry Pi OS Lite 64-bit (Bookworm), set hostname `nebula-cam`,
    preconfigure the Deck's SSID in Imager.
 2. `git clone https://github.com/GamerNationinc/RPi-pMapper.git && cd RPi-pMapper`
    then `sudo ./install.sh`, reboot.
-3. Confirm the FC link and a `STATUSTEXT` heartbeat in QGC.
+3. `nebula-top` shows `S2 READY` (or `S1 NOLINK` if TELEM2 isn't right yet).
 4. Set the ArduPilot params above.
 5. Bench-trigger 20 frames, check EXIF, run the latency calibration.
 6. Create the `/data` partition, add it to `/etc/fstab`.

@@ -37,3 +37,31 @@ fallback_after_s = 20.0
 [system]
 set_clock_from_gps = true
 status_period_s = 5.0
+
+[telemetry]
+# Serial <-> UDP MAVLink bridge so a GCS on the WiFi (laptop or Deck) sees the
+# vehicle. QGC autoconnects on 14550. The FC's own radio never routes through
+# the Pi - this is a second path, not a replacement.
+udp_enabled = true
+udp_port = 14550
+
+[status]
+# Live snapshot for nebula-top and the phone/laptop page. tmpfs only.
+file = "/run/nebula-cam/status.json"
+http_port = 8080            # http://nebula-cam.local:8080/   (0 = off)
+
+[wifi]
+# Applied at boot by nebula-wifi.service. Highest priority in range wins.
+# Anyone with the SD card can read these; use hotspot passwords you don't
+# care about.
+band = "bg"                 # lock to 2.4 GHz - range beats throughput in the field
+networks = [
+  { ssid = "NEBULA-GCS",     psk = "changeme", priority = 20 },   # Steam Deck hotspot
+  { ssid = "NEBULA-LAPTOP",  psk = "changeme", priority = 10 },   # laptop hotspot
+]
+# If nothing above is in range after fallback_after_s, host our own AP so the
+# Pi is always reachable: join it, then http://10.42.0.1:8080/
+fallback_ap = true
+fallback_ap_ssid = "NEBULA-CAM"
+fallback_ap_psk = "nebulacam"
+fallback_after_s = 45

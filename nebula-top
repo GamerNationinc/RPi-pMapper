@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+nebula-top - live view of the nebula-cam service. Think btop, for one program.
+
+  nebula-top                       # on the Pi: reads /run/nebula-cam/status.json
+  nebula-top http://nebula-cam.local:8080   # from a laptop on the same WiFi
+  nebula-top --once                # print one frame and exit (for scripts / ssh)
+
+Keys: q quit, l toggle log pane.
+"""
+
+import sys
+import json
+import time
+import urllib.request
+
+DEFAULT_FILE = "/run/nebula-cam/status.json"
+
+STATE_HELP = {
+    "S0": "INIT    camera starting",
+    "S1": "NOLINK  camera up, no FC heartbeat",
+    "S2": "READY   linked, disarmed",
+    "S3": "REC     armed, session open",
+}
+FLAG_HELP = {
+    "HBLOST":   "FC heartbeat older than 3 s",
+    "NOGPS":    "GPS fix < 3D - no geotags",
+    "NOCLOCK":  "no SYSTEM_TIME from FC - UTC unknown",
+    "DROP":     "frames dropped this session",
+    "DISKLOW":  "below min_free_mb - session refused",
+    "CAMERR":   "a capture has failed",
+    "WRITEERR": "a JPEG write has failed",
+    "UNDERVOLT": "board under-voltage - fix power NOW",
+    "THROTTLE": "CPU throttled (heat)",
+    "SLOW":     "avg write > 1.2 s - slow down or drop resolution",
+}
+SEVERE = {"DISKLOW", "CAMERR", "WRITEERR", "UNDERVOLT", "HBLOST"}
+
+
+def fetch(source):
+    if source.startswith("http"):
+        url = source.rstrip("/") + "/status.json"
+        with urllib.request.urlopen(url, timeout=2.0) as r:
+            return json.load(r)
+    with open(source) as fh:
+        return json.load(fh)
+
+
+def fmt(v, unit="", nd=1, none="-"):
+    if v is None:
+        return none
+    if isinstance(v, float):
+        return f"{v:.{nd}f}{unit}"
+    return f"{v}{unit}"
+
+
+def bar(n, mx, width=12):
+    fill = 0 if not mx else int(round(width * n / mx))
+    return "[" + "#" * fill + "." * (width - fill) + f"] {n}/{mx}"
+
+
+def hms(s):
+    s = int(s)
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m{s % 60:02d}s"
+
+
+def render(snap, width=80, show_log=True):
+    """Pure: snapshot -> list of (text, level). level: '', 'ok', 'warn', 'bad'."""
+    L, C, S, ST, Q, Y = (snap["link"], snap["camera"], snap["session"],
+                         snap["storage"], snap["queues"], snap["system"])
+    flags = snap["flags"]
+    head_level = "bad" if any(f in SEVERE for f in flags) else ("warn" if flags else "ok")
+    out = []
+    age = time.time() - snap.get("ts", 0)
+    stale = f"  STALE {age:.0f}s" if age > 5 else ""
+    out.append((f" nebula-cam  {snap['code']} {snap['state']}  {' '.join(flags)}"
+                f"  up {hms(snap['uptime_s'])}{stale}", "bad" if stale else head_level))
+    out.append(("", ""))
+
+    lvl = "ok" if L["linked"] and "HBLOST" not in flags else "bad"
+    out.append((f" FC LINK   {'up' if L['linked'] else 'DOWN':5} {L['device']}"
+                f"  hb {fmt(L['hb_age_s'], 's')}  {L['msg_rate']:>3} msg/s", lvl))
+    gl = "ok" if L["fix"] >= 3 else "warn"
+    out.append((f"   GPS     fix {L['fix']}  sats {L['sats']}  eph {fmt(L['eph'], ' m', 2)}"
+                f"   clock {'gps' if L['clock'] else 'NONE'}"
+                f"{' (stepped)' if L.get('clock_stepped') else ''}", gl))
+    out.append(("", ""))
+
+    cl = "ok" if C["ready"] and not C["errors"] else "bad"
+    out.append((f" CAMERA    {'up' if C['ready'] else 'DOWN':5} {C['size'][0]}x{C['size'][1]}"
+                f"  {fmt(C['exposure_us'], 'us')} gain {fmt(C['gain'], '', 2)}"
+                f" {'locked' if C['locked'] else 'auto'}"
+                f"  last {fmt(C['last_capture_age_s'], 's')}  err {C['errors']}", cl))
+    out.append(("", ""))
+
+    sl = "ok" if S["frames"] and not S["dropped"] else ("warn" if S["dropped"] else "")
+    out.append((f" SESSION   {S['dir'] or '(none - disarmed)'}", sl))
+    out.append((f"   frames {S['frames']:>5}  dropped {S['dropped']:>3}"
+                f"  write {fmt(S['last_write_s'], 's', 2)} avg {fmt(S['avg_write_s'], 's', 2)}"
+                f"  {S['written_mb']:.0f} MB  err {S['write_errors']}",
+                "warn" if "SLOW" in flags else ""))
+    out.append((f"   queues  capture {bar(*Q['capture'])}   write {bar(*Q['write'])}",
+                "warn" if Q["write"][0] >= Q["write"][1] else ""))
+    out.append((f" STORAGE   {ST['free_mb']:.0f} MB free  ~{ST['shots_left']} frames left",
+                "bad" if "DISKLOW" in flags else ""))
+    out.append(("", ""))
+
+    thr = ",".join(Y["throttle_flags"]) or "none"
+    bl = "bad" if "UNDERVOLT" in flags else ("warn" if "THROTTLE" in flags else "")
+    out.append((f" BOARD     {fmt(Y['cpu_temp_c'], 'C', 0)}  load {fmt(Y['load1'], '', 2)}"
+                f"  mem {fmt(Y['mem_free_mb'], ' MB free', 0)}  throttled {Y['throttled']} {thr}", bl))
+    w = Y["wifi"]
+    peers = " ".join(Y["udp_peers"]) or "none (broadcasting)"
+    out.append((f" WIFI      {w.get('ssid') or '-'}  {fmt(w.get('rssi_dbm'), ' dBm')}"
+                f"  {w.get('ip') or 'no ip'}   udp -> {peers}"
+                f"  rx {Y.get('udp_rx_kb', 0):.0f}k tx {Y.get('udp_tx_kb', 0):.0f}k",
+                "" if w.get("ip") else "warn"))
+
+    if flags:
+        out.append(("", ""))
+        for f in flags:
+            out.append((f"   {f:<9} {FLAG_HELP.get(f, '')}", "bad" if f in SEVERE else "warn"))
+
+    if show_log:
+        out.append(("", ""))
+        out.append((" LOG", ""))
+        for line in snap["log"][-12:]:
+            out.append(("   " + line, ""))
+    return [(t[:width - 1], lv) for t, lv in out]
+
+
+def run_curses(source, show_log=True):
+    import curses
+
+    def main(scr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        colors = {"ok": curses.color_pair(1), "warn": curses.color_pair(2),
+                  "bad": curses.color_pair(3) | curses.A_BOLD, "": 0}
+        scr.nodelay(True)
+        nonlocal show_log
+        while True:
+            h, w = scr.getmaxyx()
+            try:
+                lines = render(fetch(source), w, show_log)
+            except Exception as exc:
+                lines = [(f" nebula-cam: no status from {source}", "bad"),
+                         (f"   {exc}", ""), ("", ""),
+                         ("   is the service running?  systemctl status nebula-cam", "")]
+            scr.erase()
+            for y, (text, lvl) in enumerate(lines[:h - 1]):
+                try:
+                    scr.addstr(y, 0, text, colors[lvl])
+                except curses.error:
+                    pass
+            try:
+                scr.addstr(h - 1, 0, " q quit  l log "[:w - 1], curses.A_REVERSE)
+            except curses.error:
+                pass
+            scr.refresh()
+            t_end = time.time() + 1.0
+            while time.time() < t_end:
+                k = scr.getch()
+                if k in (ord("q"), 27):
+                    return
+                if k == ord("l"):
+                    show_log = not show_log
+                    break
+                time.sleep(0.05)
+
+    curses.wrapper(main)
+
+
+def main(argv):
+    once = "--once" in argv
+    args = [a for a in argv if not a.startswith("--")]
+    source = args[0] if args else DEFAULT_FILE
+    if once:
+        for text, _ in render(fetch(source)):
+            print(text)
+        return 0
+    run_curses(source)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
