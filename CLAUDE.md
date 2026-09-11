@@ -25,7 +25,15 @@ operator manual; this file is for working on the code.
 - `nebula-cam.service` — `Type=notify`, `Restart=always`, `WatchdogSec=20`.
 - `nebula-cam.toml` — config; deployed copy lives at
   `/boot/firmware/nebula-cam.toml` so it is editable from an SD reader.
-  `DEFAULTS` in `nebula_cam.py` must stay in sync with it.
+  Sections: `[link] [camera] [storage] [mission] [system] [telemetry]
+  [status]` are read by the service (`DEFAULTS` in `nebula_cam.py` must
+  stay in sync); `[wifi]` is read only by `nebula-wifi`.
+- `tests/` — `test_geotag.py` and `test_pipeline.py`, hardware stubbed,
+  runnable on Windows. See `tests/README.md`. Run both before committing.
+- `install.sh` installs: `nebula_cam.py` → `/opt/nebula-cam/`,
+  `nebula-top`/`nebula-wifi` → `/usr/local/bin/`, both `.service` files,
+  the TOML to the boot partition (first time only). `nebula-update` on the
+  Pi reinstalls the same list — add new files to **both** lists.
 
 ## Status model
 
@@ -56,8 +64,10 @@ condition in exactly those two methods and document it in README §9 and
   card.
 - Root filesystem is read-only in the field (overlayfs). Only `/data` is
   writable. Don't add anything that writes elsewhere at runtime.
-- No network dependency anywhere in the boot or capture path. WiFi is an
-  offload convenience only.
+- No network dependency anywhere in the boot or capture path. WiFi carries
+  the UDP telemetry bridge, the status page and offload — all optional,
+  all must degrade to nothing when WiFi is absent. The FC's own radio is
+  the primary control link; the bridge is a second path, never the only one.
 - EXIF `GPSAltitude` is WGS-84 ellipsoidal (from `GPS_RAW_INT`). AMSL and
   AGL go in the CSV/XMP. Don't swap conventions.
 - Unhandled errors should exit; systemd restarts us. Don't add retry loops
@@ -85,19 +95,30 @@ condition in exactly those two methods and document it in README §9 and
   LF; if you generate files with Python `write_text`, strip CRs before
   committing (`sed -i 's/\r$//'`).
 - Hardware modules (`picamera2`, `libcamera`, `pymavlink`, `simplejpeg`)
-  aren't installable here. To test the pure-Python parts (`StateBuffer`,
-  `build_exif`, `build_xmp`, `insert_xmp`), stub those modules in
-  `sys.modules` before `import nebula_cam`; `piexif` and `pillow` are all
-  that's needed. Always run `python -m py_compile nebula_cam.py` and
-  `bash -n install.sh` before committing.
-- Nothing here can exercise capture or the serial link. State clearly what
-  was tested locally vs. what needs the Pi.
+  aren't installable here; `tests/` stubs them in `sys.modules` and shims
+  the Linux-only bits (`CLOCK_BOOTTIME`, `os.sync`, `statvfs`,
+  `O_DIRECTORY`). Needs `piexif pillow numpy`. Before committing:
+
+      python -m py_compile nebula_cam.py nebula-top nebula-wifi
+      bash -n install.sh
+      python tests/test_geotag.py && python tests/test_pipeline.py
+
+- Bash heredocs in this environment mangle backslashes (`\U` in Windows
+  paths breaks Python). Write patch scripts with the Write tool and run
+  them, or use `sed` by line number.
+- Nothing here can exercise capture, the serial port, NetworkManager or
+  curses on a real terminal. State clearly what was tested locally vs.
+  what needs the Pi.
 
 ## Deploying
 
     git clone https://github.com/GamerNationinc/RPi-pMapper.git && cd RPi-pMapper
     sudo ./install.sh && sudo reboot
-    journalctl -u nebula-cam -f      # expect "camera up", "linked to system 1"
+    nebula-top                       # expect S2 READY; S1 NOLINK = no FC heartbeat
+    journalctl -u nebula-cam -f      # "camera up", "linked to system 1"
+
+From a laptop on the same WiFi: `http://nebula-cam.local:8080/` or
+`nebula-top http://nebula-cam.local:8080`. QGC autoconnects on UDP 14550.
 
 Updating a locked Pi: `sudo nebula-update` (may reboot twice), then
 `sudo nebula-lock`. Forgetting the lock leaves root writable in the field.
