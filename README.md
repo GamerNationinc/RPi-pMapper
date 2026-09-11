@@ -2,7 +2,19 @@
 
 Photogrammetry capture pod for Nebula. Pi Zero 2 W + Camera Module 3 (IMX708),
 MAVLink to a MicoAir743-AIO over TELEM2, geotagged JPEGs straight out of the
-box into Metashape / Pix4D / ODM.
+box into Metashape / Pix4D / ODM. The flight controller triggers, the Pi
+listens, tags each frame at the sensor's own exposure timestamp, and tells you
+what it is doing — in QGC, on a phone, or in a terminal.
+
+| File | What it is |
+|---|---|
+| `nebula_cam.py` | The service. Capture, geotag, CSV, MAVLink, UDP telemetry bridge, status |
+| `nebula-cam.toml` | The only thing you edit. Lives on the boot partition, readable from any SD reader |
+| `install.sh` | One-shot Pi provisioning. Run once, image the card, never again |
+| `nebula-cam.service` | systemd unit: notify + watchdog + restart forever |
+| `nebula-top` | btop-style live status, on the Pi or from a laptop (§9) |
+| `nebula-wifi` / `.service` | Turns `[wifi]` in the TOML into hotspot profiles at boot (§7) |
+| `tests/` | Runs anywhere, no hardware; what the code does and doesn't promise |
 
 ---
 
@@ -29,6 +41,9 @@ Call it 30 g on a sub-250 g airframe.
 
 ## 2. ArduPilot parameters
 
+ArduPilot 4.4 or newer (the MicoAir743-AIO needs 4.5+). Older firmware uses
+the `CAM_` prefix and different units — don't copy these into it.
+
 ```
 SERIAL2_PROTOCOL   2        # MAVLink2
 SERIAL2_BAUD       921
@@ -36,21 +51,20 @@ SERIAL2_OPTIONS    0
 
 CAM1_TYPE          1        # Servo. Emits CAMERA_FEEDBACK on every trigger,
                             # whether or not the Pi is alive.
-CAM1_DURATION      10       # 1.0 s pulse
+CAM1_DURATION      1.0      # seconds the servo output is held
 CAM1_TRIGG_DIST    7.7      # metres - see the table below
 CAM1_MIN_INTERVAL  1200     # ms floor; protects against overspeed triggering
-CAM1_RELAY_ON      1
+SERVO9_FUNCTION    10       # any spare output: CameraTrigger
 ```
 
-Assign a spare servo output to `RCx_OPTION`/`SERVOx_FUNCTION = 10` (CameraTrigger)
-so the trigger is real rather than notional. Nothing needs to be plugged into
-it — we only care that the FC generates the event and the feedback message.
+The servo output makes the trigger real rather than notional. Nothing needs to
+be plugged into it — we only care that the FC generates the event and the
+`CAMERA_FEEDBACK` message.
 
 `SR2_*` stream rates are set by the Pi at connect via `SET_MESSAGE_INTERVAL`,
 so you don't need to touch them. The Pi speaks MAVLink 2 as system 1 /
-component 191 (`MAV_COMP_ID_ONBOARD_COMPUTER`) and sends a heartbeat every
-`status_period_s`, so it shows up in QGC as a component of the vehicle, not
-as a second vehicle.
+component 191 (`MAV_COMP_ID_ONBOARD_COMPUTER`) with a 1 Hz heartbeat, so it
+shows up in QGC as a component of the vehicle, not as a second vehicle.
 
 **Optional, later:** run a wire from a Pi GPIO back to a FC input configured as
 `CAM1_FEEDBACK_PIN`. That lets the flight controller stamp the *true* shutter
@@ -77,10 +91,11 @@ Assumes the long sensor axis is mounted **across track**. Rotate the mount 90°
 and the trigger distance and line spacing swap.
 
 Cruise speed is capped by write throughput, not the airframe. At 50 m and
-7.7 m spacing, 5 m/s means a frame every 1.5 s. Measure your actual per-frame
-write time in the journal before committing to a big block (every frame logs
-`NEB_00042.jpg 4.3 MB in 0.87 s`); if it exceeds ~1.2 s, drop to 2304 x 1296
-(GSD doubles) or slow down.
+7.7 m spacing, 5 m/s means a frame every 1.5 s. The writer buffers three
+frames, so a burst is fine; the *average* is what matters. Measure it before
+committing to a big block: every frame logs `NEB_00042.jpg 4.3 MB in 0.87 s`,
+`nebula-top` shows the running average, and the `SLOW` flag comes on above
+1.2 s. If you see it, drop to 2304 x 1296 (GSD doubles) or slow down.
 
 **Rolling shutter:** the IMX708 reads out progressively. At 5 m/s the top and
 bottom of a frame are captured ~20 ms apart, which is ~10 cm of along-track
@@ -99,7 +114,8 @@ whatever residual remains.
 **Bench method:**
 1. Put the drone on the bench with GPS lock, props off, and arm it.
 2. Display a GPS-disciplined millisecond clock on a phone or laptop screen.
-3. Trigger 20 frames manually (`MAV_CMD_DO_DIGICAM_CONTROL` from QGC).
+3. Trigger 20 frames manually (`MAV_CMD_DO_DIGICAM_CONTROL` from QGC — the
+   camera button in the fly view; the Pi acknowledges it).
 4. Compare the clock visible in each image against the `utc_time` column
    in `geotags.csv`.
 5. Median difference, in ms, goes into `extra_latency_ms`.
@@ -123,8 +139,14 @@ Per flight, `/data/flights/flight_YYYYMMDD_HHMMSSZ/`:
   direction, exposure and gain; XMP with camera yaw/pitch/roll in both Pix4D
   and DJI schemas.
 - `geotags.csv` — filename, UTC, lat, lon, three altitudes, attitude, fix
-  type, satellite count, EPH. Flushed and fsync'd after every row, so a
+  type, satellite count, EPH, exposure, gain, and `fc_img_idx` — the flight
+  controller's own image counter, so each frame can be matched to the `CAM`
+  message in its dataflash log. Flushed and fsync'd after every row, so a
   power cut costs you at most the frame in flight.
+
+Filenames come from the Pi's own counter and restart at `00001` for every
+flight directory. A blank `fc_img_idx` means the frame came from a manual
+trigger rather than `CAM_TRIGG_DIST`.
 
 Metashape and Pix4D read the EXIF and XMP directly — import the folder and go.
 ODM does too, but feed it the CSV as a GCP/geo file if you want the attitude
@@ -146,11 +168,14 @@ swapping conventions mid-project shifts a block vertically by that amount.
 | Kernel/board hang | BCM hardware watchdog, 15 s |
 | Python hang | systemd `WatchdogSec=20`, fed by the status thread |
 | Service crash | `Restart=always`, `StartLimitIntervalSec=0` — it never gives up |
+| FC powered up after the Pi, or rebooted in the field | Camera comes up and reports `NOLINK`; the link is retried forever and picked up whenever it appears |
 | WiFi not present | No network unit in the boot path; both wait-online units masked; `nebula-wifi` is a separate oneshot |
 | No RTC → 1970 timestamps | Clock stepped from MAVLink `SYSTEM_TIME` on first fix, plus `fake-hwclock` |
-| Card full | Session refused below 512 MB, shouted over MAVLink |
-| Camera dead / cable loose | `STATUSTEXT` heartbeat is absent or reports an error — visible in QGC before takeoff |
-| Frames arriving faster than we write | Bounded queues, drop counter reported in the status line |
+| Card full | Session refused below 512 MB (`DISKLOW`), shouted over MAVLink |
+| Camera dead / cable loose | State never leaves `INIT`, or `CAMERR` — visible in QGC before takeoff |
+| Frames arriving faster than we write | Bounded queues; dropped frames are counted (`DROP`), never block the trigger path |
+| Disarmed with frames still queued | Session closes *behind* its last frame, in order; nothing captured is lost |
+| Out of memory | Raw-frame queue is capped at 3 (~107 MB) on a 512 MB board with no swap |
 
 The pre-flight check is one line in the QGC message panel:
 
@@ -232,6 +257,9 @@ sends on TELEM2 (at the 10 Hz rates the Pi requests) plus the Pi's own
 `STATUSTEXT` lines arrive, and anything the GCS sends goes straight to the FC
 — parameters, mission upload, mode changes, `DO_DIGICAM_CONTROL`.
 
+QGC will list the Pi as a second component (191, "onboard computer") of the
+same vehicle. That is expected and harmless.
+
 Two rules:
 
 1. **This is a second path, not the primary one.** If the drone is flown on a
@@ -294,9 +322,9 @@ same sum is −81 dBm and the margin evaporates in the real world.
   `nmcli device wifi hotspot ifname wlx… ssid NEBULA-GCS password …`.
 - **Point the panel** at the survey block and raise it: 2–3 m on a light
   mast beats anything else you can do for the money.
-- **Airframe:** the Zero 2 W's antenna is the trace at the board edge next
-  to the camera connector. Mount that edge outboard, away from carbon fibre,
-  the battery and the GPS mast. Carbon is a near-perfect shield.
+- **Airframe:** the Zero 2 W's antenna is the small triangular copper
+  pattern on the board edge. Mount that edge outboard, away from carbon
+  fibre, the battery and the GPS mast. Carbon is a near-perfect shield.
 - **Power saving off** on the Pi (installer does this; `nebula-wifi` sets it
   on every profile it creates) — power save is what makes a link that
   *looks* fine drop packets every few seconds.
@@ -367,16 +395,20 @@ if you want to script against it.
 
 ## 10. Build order
 
-1. Flash Raspberry Pi OS Lite 64-bit (Bookworm), set hostname `nebula-cam`,
-   preconfigure the Deck's SSID in Imager.
+1. Flash Raspberry Pi OS Lite 64-bit (Bookworm) with Imager: hostname
+   `nebula-cam`, your user, SSH on, and a WiFi network that has **internet**
+   (home WiFi is fine — it's only for the next step).
 2. `git clone https://github.com/GamerNationinc/RPi-pMapper.git && cd RPi-pMapper`
    then `sudo ./install.sh`, reboot.
-3. `nebula-top` shows `S2 READY` (or `S1 NOLINK` if TELEM2 isn't right yet).
-4. Set the ArduPilot params above.
-5. Bench-trigger 20 frames, check EXIF, run the latency calibration.
-6. Create the `/data` partition, add it to `/etc/fstab`.
-7. `sudo nebula-lock`.
-8. Power down, image the card as `nebula-cam-v1.img`.
+3. Edit `/boot/firmware/nebula-cam.toml`: the hotspot SSIDs and passwords in
+   `[wifi]`. Everything else can stay at defaults for now.
+4. `nebula-top` shows `S2 READY` (or `S1 NOLINK` if TELEM2 isn't right yet).
+5. Set the ArduPilot params above. `NOLINK` should become `READY`.
+6. Bench-trigger 20 frames, check EXIF, run the latency calibration, put the
+   result in `extra_latency_ms`.
+7. Create the `/data` partition, add it to `/etc/fstab`.
+8. `sudo nebula-lock`.
+9. Power down, image the card as `nebula-cam-v1.img`.
 
-Steps 1–7 happen once, ever. After that a new pod is: flash the image, edit
+Steps 1–8 happen once, ever. After that a new pod is: flash the image, edit
 one TOML file on the boot partition if anything differs, fly.
