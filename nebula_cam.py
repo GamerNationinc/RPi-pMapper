@@ -271,7 +271,7 @@ def _deg_to_dms_rational(value):
     return ((d, 1), (m, 1), (s, 10000))
 
 
-def build_exif(fix, utc_dt, cfg, meta):
+def build_exif(fix, utc_dt, meta):
     lat, lon = fix["lat"], fix["lon"]
     alt = fix["alt_ellip"]
     if not math.isfinite(alt):
@@ -365,7 +365,7 @@ CSV_HEADER = [
     "filename", "utc_time", "latitude", "longitude",
     "alt_ellipsoid_m", "alt_msl_m", "alt_agl_m",
     "yaw_deg", "pitch_deg", "roll_deg",
-    "fix_type", "sats", "eph_m", "exposure_us", "gain", "img_idx",
+    "fix_type", "sats", "eph_m", "exposure_us", "gain", "fc_img_idx",
 ]
 
 
@@ -407,6 +407,21 @@ class FlightSession:
 # Service
 # --------------------------------------------------------------------------
 
+# What a frame gets tagged with when the telemetry window has nothing for it.
+NO_FIX = {k: float("nan") for k in
+          ("lat", "lon", "alt_amsl", "alt_rel", "alt_ellip", "roll", "pitch", "yaw")}
+NO_FIX.update({"fix": 0, "sats": 0, "eph": float("nan")})
+
+# One raw 4608x2592 BGR888 frame is 35.8 MB. The Zero 2 W has 512 MB and no
+# swap (install.sh removes it), so this queue *is* the memory budget:
+# 3 frames ~ 107 MB. Do not raise it without measuring.
+WRITE_QUEUE_FRAMES = 3
+
+# Queue sentinel. (CLOSE, session) flows capture_q -> write_q behind every
+# frame captured before it, so a session closes only after its last frame.
+CLOSE = "CLOSE"
+
+
 class NebulaCam:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -415,10 +430,13 @@ class NebulaCam:
         self.stop = threading.Event()
 
         self.capture_q = queue.Queue(maxsize=4)
-        self.write_q = queue.Queue(maxsize=8)
+        self.write_q = queue.Queue(maxsize=WRITE_QUEUE_FRAMES)
+
+        # pymavlink does not lock its writer; four threads send on this link.
+        self.tx_lock = threading.Lock()
 
         self.armed = False
-        self.session = None
+        self.session = None            # non-None == recording
         self.session_lock = threading.Lock()
         self.img_idx = 0
         self.dropped = 0
@@ -427,6 +445,7 @@ class NebulaCam:
         self.last_fallback_pos = None
         self.gps_epoch_offset = None   # unix - boottime, from SYSTEM_TIME
         self.mav = None
+        self.linked = False
         self.picam = None
         self.cam_ready = False
 
@@ -489,24 +508,46 @@ class NebulaCam:
 
     # -- MAVLink ---------------------------------------------------------
     def mav_connect(self):
+        """Block until the autopilot's heartbeat is seen. Never gives up, and
+        never holds up the rest of the service: the camera is READY and the
+        watchdog is fed whether or not the FC is powered."""
         link = self.cfg["link"]
+        self.linked = False
         while not self.stop.is_set():
             try:
-                self.mav = mavutil.mavlink_connection(
-                    link["device"], baud=link["baud"],
-                    source_system=link["source_system"],
-                    source_component=link["source_component"],
-                    autoreconnect=True,
-                )
-                log(f"waiting for heartbeat on {link['device']}")
-                self.mav.wait_heartbeat(timeout=10)
+                if self.mav is None:
+                    self.mav = mavutil.mavlink_connection(
+                        link["device"], baud=link["baud"],
+                        source_system=link["source_system"],
+                        source_component=link["source_component"],
+                        autoreconnect=True,
+                    )
+                    log(f"waiting for heartbeat on {link['device']}")
+                self.mav.wait_heartbeat(timeout=5)
                 if self.mav.target_system:
+                    self.linked = True
                     log(f"linked to system {self.mav.target_system}")
                     self.request_streams()
                     return
             except Exception as exc:
                 log(f"link error: {exc}")
-            time.sleep(2)
+                try:
+                    self.mav.close()
+                except Exception:
+                    pass
+                self.mav = None
+                self.stop.wait(2.0)
+
+    def _send(self, name, *args):
+        """Every TX goes through here so packets never interleave."""
+        mav = self.mav
+        if mav is None:
+            return
+        try:
+            with self.tx_lock:
+                getattr(mav.mav, name)(*args)
+        except Exception:
+            pass
 
     def request_streams(self):
         rate_us = int(1e6 / max(1, self.cfg["link"]["stream_rate_hz"]))
@@ -517,33 +558,30 @@ class NebulaCam:
             (mavutil.mavlink.MAVLINK_MSG_ID_SYSTEM_TIME, 1000000),
         ]
         for msg_id, interval in wanted:
-            try:
-                self.mav.mav.command_long_send(
-                    self.mav.target_system, self.mav.target_component,
-                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-                    msg_id, interval, 0, 0, 0, 0, 0)
-            except Exception:
-                pass
+            self._send("command_long_send",
+                       self.mav.target_system, self.mav.target_component,
+                       mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                       msg_id, interval, 0, 0, 0, 0, 0)
             time.sleep(0.05)
 
     def statustext(self, severity, text):
-        try:
-            self.mav.mav.statustext_send(severity, text.encode()[:50])
-        except Exception:
-            pass
+        self._send("statustext_send", severity, text.encode()[:50])
 
     def heartbeat(self):
         """Announce ourselves as an onboard computer on the vehicle's sysid.
         ArduPilot only routes to channels it has learned a route on."""
-        try:
-            self.mav.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0,
-                mavutil.mavlink.MAV_STATE_ACTIVE)
-        except Exception:
-            pass
+        self._send("heartbeat_send",
+                   mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                   mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0,
+                   mavutil.mavlink.MAV_STATE_ACTIVE)
+
+    def addressed_to_us(self, msg):
+        link = self.cfg["link"]
+        return (getattr(msg, "target_system", None) == link["source_system"] and
+                getattr(msg, "target_component", None) == link["source_component"])
 
     def mav_loop(self):
+        self.mav_connect()
         while not self.stop.is_set():
             try:
                 msg = self.mav.recv_match(blocking=True, timeout=1.0)
@@ -577,6 +615,10 @@ class NebulaCam:
             elif kind == "COMMAND_LONG" and \
                     msg.command == mavutil.mavlink.MAV_CMD_DO_DIGICAM_CONTROL:
                 self.enqueue_capture(t, None)
+                if self.addressed_to_us(msg):
+                    # QGC's manual trigger waits for this before it stops spinning.
+                    self._send("command_ack_send", msg.command,
+                               mavutil.mavlink.MAV_RESULT_ACCEPTED)
 
     def handle_system_time(self, msg, t):
         if msg.time_unix_usec <= 0:
@@ -585,15 +627,17 @@ class NebulaCam:
         self.gps_epoch_offset = unix - t
         if not self.cfg["system"]["set_clock_from_gps"] or self.clock_set:
             return
-        if abs(time.time() - unix) > 3.0 and os.geteuid() == 0:
-            try:
-                time.clock_settime(time.CLOCK_REALTIME, unix)
-                subprocess.run(["fake-hwclock", "save"], check=False,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log(f"clock stepped from GPS -> {datetime.now(timezone.utc)}")
-            except Exception as exc:
-                log(f"clock step failed: {exc}")
-        self.clock_set = True
+        if abs(time.time() - unix) <= 3.0 or os.geteuid() != 0:
+            self.clock_set = True      # nothing to do, or nothing we can do
+            return
+        try:
+            time.clock_settime(time.CLOCK_REALTIME, unix)
+            subprocess.run(["fake-hwclock", "save"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(f"clock stepped from GPS -> {datetime.now(timezone.utc)}")
+            self.clock_set = True
+        except Exception as exc:
+            log(f"clock step failed: {exc}")   # retried on the next SYSTEM_TIME
 
     def handle_heartbeat(self, msg):
         # Only the autopilot's own heartbeat carries the armed flag.
@@ -611,30 +655,39 @@ class NebulaCam:
 
     def on_arm(self):
         log("ARMED")
-        if free_mb(self.cfg["storage"]["root"]) < self.cfg["storage"]["min_free_mb"]:
-            self.statustext(2, "CAM DISK FULL - not capturing")
-            log("refusing session: disk below threshold")
-            return
-        with self.session_lock:
-            if self.session is None:
-                self.session = FlightSession(self.cfg["storage"]["root"])
         self.img_idx = 0
         self.dropped = 0
         self.last_fallback_pos = None
+        if free_mb(self.cfg["storage"]["root"]) < self.cfg["storage"]["min_free_mb"]:
+            self.statustext(2, "CAM DISK FULL - not capturing")
+            log("refusing session: disk below threshold")
+            return                     # no session -> enqueue_capture ignores triggers
+        with self.session_lock:
+            if self.session is None:
+                self.session = FlightSession(self.cfg["storage"]["root"])
         threading.Thread(target=self.lock_exposure, daemon=True).start()
 
     def on_disarm(self):
         log("DISARMED")
-        time.sleep(2.0)   # let the queues drain
-        with self.session_lock:
-            if self.session:
-                self.session.close()
-                self.session = None
+        self.close_session()
         try:
             self.picam.set_controls({"AeEnable": True, "AwbEnable": True})
         except Exception:
             pass
-        os.sync()
+
+    def close_session(self, timeout=5.0):
+        """Detach the session and send it down the pipeline behind its frames.
+        Returns immediately; the writer closes it. Nothing here blocks the
+        MAVLink thread for long."""
+        with self.session_lock:
+            session, self.session = self.session, None
+        if session is None:
+            return
+        try:
+            self.capture_q.put((CLOSE, session), timeout=timeout)
+        except queue.Full:
+            log("capture queue stuck - closing session directly")
+            session.close()
 
     def maybe_fallback_trigger(self, msg):
         """Only used if the FC never sends CAMERA_FEEDBACK."""
@@ -653,22 +706,29 @@ class NebulaCam:
             self.last_fallback_pos = (lat, lon)
             self.enqueue_capture(boottime(), None)
 
-    def enqueue_capture(self, t_trigger, img_idx):
-        if not self.armed or not self.cam_ready:
+    def enqueue_capture(self, t_trigger, fc_idx):
+        with self.session_lock:
+            session = self.session
+        if session is None or not self.cam_ready:
             return
         try:
-            self.capture_q.put_nowait((t_trigger, img_idx))
+            self.capture_q.put_nowait((t_trigger, fc_idx, session))
         except queue.Full:
             self.dropped += 1
             log("capture queue full - frame dropped")
 
     # -- capture / write -------------------------------------------------
     def capture_loop(self):
-        while not self.stop.is_set():
+        # Keep draining after stop so a SIGTERM mid-flight loses nothing queued.
+        while not (self.stop.is_set() and self.capture_q.empty()):
             try:
-                t_trigger, img_idx = self.capture_q.get(timeout=1.0)
+                item = self.capture_q.get(timeout=1.0)
             except queue.Empty:
                 continue
+            if item[0] is CLOSE:
+                self.write_q.put(item)     # ordering matters more than latency here
+                continue
+            t_trigger, fc_idx, session = item
             try:
                 request = self.picam.capture_request()
             except Exception as exc:
@@ -690,10 +750,12 @@ class NebulaCam:
                 t_expose = t_trigger
             t_expose += self.cfg["camera"]["extra_latency_ms"] / 1000.0
 
+            # Filenames come from our own counter, always. The FC's img_idx
+            # is recorded in the CSV for cross-referencing its dataflash log,
+            # but mixing the two sources would let os.replace() overwrite.
             self.img_idx += 1
-            idx = img_idx if img_idx is not None else self.img_idx
             try:
-                self.write_q.put_nowait((array, meta, t_expose, idx))
+                self.write_q.put_nowait((array, meta, t_expose, self.img_idx, fc_idx, session))
             except queue.Full:
                 self.dropped += 1
                 log("write queue full - frame dropped")
@@ -712,23 +774,21 @@ class NebulaCam:
 
     def write_loop(self):
         import io
-        while not self.stop.is_set():
+        while not (self.stop.is_set() and self.write_q.empty()):
             try:
-                array, meta, t_expose, idx = self.write_q.get(timeout=1.0)
+                item = self.write_q.get(timeout=1.0)
             except queue.Empty:
                 continue
-            with self.session_lock:
-                session = self.session
-            if session is None:
+            if item[0] is CLOSE:
+                item[1].close()
+                os.sync()
                 continue
+            array, meta, t_expose, idx, fc_idx, session = item
 
             fix = self.buf.sample(t_expose)
             if fix is None:
                 log("no telemetry for frame - writing without geotag")
-                fix = {k: float("nan") for k in
-                       ("lat", "lon", "alt_amsl", "alt_rel", "alt_ellip",
-                        "roll", "pitch", "yaw")}
-                fix.update({"fix": 0, "sats": 0, "eph": float("nan")})
+                fix = dict(NO_FIX)
 
             utc_dt = None
             if self.gps_epoch_offset is not None:
@@ -743,7 +803,7 @@ class NebulaCam:
                 if math.isfinite(fix["lat"]):
                     # piexif.insert() writes to a sink; it never returns bytes.
                     sink = io.BytesIO()
-                    piexif.insert(build_exif(fix, utc_dt, self.cfg, meta), data, sink)
+                    piexif.insert(build_exif(fix, utc_dt, meta), data, sink)
                     data = insert_xmp(sink.getvalue(), build_xmp(fix))
                 tmp = path.with_suffix(".tmp")
                 with open(tmp, "wb") as fh:
@@ -761,7 +821,7 @@ class NebulaCam:
                     f"{fix['yaw']:.2f}", f"{fix['pitch']:.2f}", f"{fix['roll']:.2f}",
                     fix["fix"], fix["sats"], f"{fix['eph']:.2f}",
                     meta.get("ExposureTime", ""), f"{meta.get('AnalogueGain', 0):.2f}",
-                    idx,
+                    "" if fc_idx is None else fc_idx,
                 ])
                 # The README asks you to read this number before planning a
                 # mission: it is the real per-frame write cost on this card.
@@ -772,48 +832,72 @@ class NebulaCam:
 
     # -- status ----------------------------------------------------------
     def status_loop(self):
+        """1 Hz: watchdog + MAVLink heartbeat. Every status_period_s: the one
+        line the operator reads in QGC before takeoff."""
         period = self.cfg["system"]["status_period_s"]
+        last_status = -period
+        last_text = None
         while not self.stop.is_set():
             self.notify.ping()
             self.heartbeat()
-            mb = free_mb(self.cfg["storage"]["root"])
-            shots = int(mb / 4.5)   # ~4.5 MB per 12 MP frame
-            with self.session_lock:
-                n = self.session.count if self.session else 0
-            state = "REC" if self.session else ("READY" if self.cam_ready else "INIT")
-            text = f"CAM {state} {n}f {shots} left"
-            if self.dropped:
-                text += f" DROP{self.dropped}"
-            self.notify.status(text)
-            sev = 4 if (self.dropped or not self.cam_ready or mb < 512) else 6
-            self.statustext(sev, text)
-            self.stop.wait(period)
+            now = time.monotonic()
+            if now - last_status >= period:
+                last_status = now
+                mb = free_mb(self.cfg["storage"]["root"])
+                shots = int(mb / 4.5)   # ~4.5 MB per 12 MP frame
+                with self.session_lock:
+                    session = self.session
+                if session:
+                    state, n = "REC", session.count
+                elif not self.cam_ready:
+                    state, n = "INIT", 0
+                elif not self.linked:
+                    state, n = "NOLINK", 0
+                else:
+                    state, n = "READY", 0
+                text = f"CAM {state} {n}f {shots} left"
+                if self.dropped:
+                    text += f" DROP{self.dropped}"
+                self.notify.status(text)
+                sev = 4 if (self.dropped or state not in ("READY", "REC") or mb < 512) else 6
+                self.statustext(sev, text)
+                if text != last_text:
+                    log(text)
+                    last_text = text
+            self.stop.wait(1.0)
 
     # -- lifecycle -------------------------------------------------------
     def run(self):
         Path(self.cfg["storage"]["root"]).mkdir(parents=True, exist_ok=True)
         self.camera_start()
-        self.mav_connect()
-        self.notify.ready()
 
-        threads = [
-            threading.Thread(target=self.mav_loop, daemon=True),
-            threading.Thread(target=self.capture_loop, daemon=True),
-            threading.Thread(target=self.write_loop, daemon=True),
-            threading.Thread(target=self.status_loop, daemon=True),
+        self.workers = [
+            threading.Thread(target=self.capture_loop, name="capture", daemon=True),
+            threading.Thread(target=self.write_loop, name="write", daemon=True),
         ]
-        for th in threads:
+        others = [
+            threading.Thread(target=self.mav_loop, name="mavlink", daemon=True),
+            threading.Thread(target=self.status_loop, name="status", daemon=True),
+        ]
+        for th in self.workers + others:
             th.start()
+        # READY as soon as the camera is up. The FC link is mav_loop's problem;
+        # a Pi that boots before the FC must not be killed for it.
+        self.notify.ready()
         while not self.stop.is_set():
             time.sleep(0.5)
         self.shutdown()
 
-    def shutdown(self):
+    def shutdown(self, drain_s=15.0):
         log("shutting down")
-        with self.session_lock:
-            if self.session:
-                self.session.close()
-                self.session = None
+        self.close_session(timeout=2.0)
+        # Workers keep draining after stop; give them a bounded window
+        # (systemd TimeoutStopSec is 90 s by default).
+        deadline = time.monotonic() + drain_s
+        for th in getattr(self, "workers", []):
+            th.join(max(0.0, deadline - time.monotonic()))
+            if th.is_alive():
+                log(f"{th.name} still busy at shutdown - queued frames may be lost")
         try:
             self.picam.stop()
         except Exception:
