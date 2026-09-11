@@ -1,0 +1,31 @@
+[Unit]
+Description=Nebula photogrammetry capture service
+# Deliberately no network dependency. WiFi must never gate the camera.
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 /opt/nebula-cam/nebula_cam.py
+WorkingDirectory=/opt/nebula-cam
+
+# Never give up. A camera that stops trying is a wasted flight.
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+# Kill and restart a hung process. status_loop() pings every 5 s.
+WatchdogSec=20
+
+# Root is required for clock_settime() from GPS and for /data writes.
+User=root
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
